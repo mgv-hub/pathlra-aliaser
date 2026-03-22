@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * pathlra-aliaser v4.6.9
+ * pathlra-aliaser v4.6.12
  *
  * Ultra-fast, high-performance path alias resolver and module loader enhancer
  * Developed by hub-mgv with extreme focus on speed, security, and developer experience
