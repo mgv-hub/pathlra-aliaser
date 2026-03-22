@@ -62,547 +62,601 @@
  * - Added parent path check to skip alias resolution inside node_modules
  */
 
-const p = require("path");
-const m = require("module");
-const f = require("fs");
-const { performance: perf } = require("perf_hooks");
+const path = require("path");
+const moduleLib = require("module");
+const fs = require("fs");
+const { performance: performanceNow } = require("perf_hooks");
 
 // Platform-agnostic path separator handling
-var s = p.sep;
-var sc = s.charCodeAt(0);
-var f_sl = 47; // Forward slash code
-var b_sl = 92; // Backslash code
-var nul = "\0"; // Null separator for cache keys
-var csz = 10000; // Max LRU cache size
-var ev_b = Math.floor(csz * 0.1); // Eviction batch size
-var lin = 0; // Strategy ID: linear scan
-var rdx = 1; // Strategy ID: radix tree
-let strat = lin; // Current active strategy
+const pathSeparator = path.sep;
+const separatorCode = pathSeparator.charCodeAt(0);
+const forwardSlashCode = 47;
+const backSlashCode = 92;
+const nullSeparator = "\0";
+const cacheMaxSize = 10000;
+const evictionBatchSize = Math.floor(cacheMaxSize * 0.1);
+const STRATEGY_LINEAR = 0;
+const STRATEGY_RADIX = 1;
+let currentStrategy = STRATEGY_LINEAR;
 
 // Developer experience flags
-let dbg = false; // Debug/verbose mode
-let hrld = false; // Hot-reload enabled
-let minMode = false; // Minimal footprint mode (<10 aliases)
+let debugMode = false;
+let hotReloadEnabled = false;
+let minimalMode = false;
 
 /**
  * Lightweight LRU cache with batch eviction
  * Optimized for high-frequency module resolution
  */
-class lru {
-  constructor(max) {
-    this.max = max;
-    this.m = new Map();
-    this.h = null;
-    this.t = null;
+class LRUCache {
+  constructor(maxSize) {
+    this.max = maxSize;
+    this.cacheMap = new Map();
+    this.head = null;
+    this.tail = null;
   }
-  get(k) {
-    const n = this.m.get(k);
-    if (!n) return undefined;
-    if (n !== this.h) {
-      if (n.prev) n.prev.next = n.next;
-      if (n.next) n.next.prev = n.prev;
-      if (n === this.t) this.t = n.prev;
-      n.prev = null;
-      n.next = this.h;
-      if (this.h) this.h.prev = n;
-      this.h = n;
+  get(key) {
+    const node = this.cacheMap.get(key);
+    if (!node) return undefined;
+    if (node !== this.head) {
+      if (node.prev) node.prev.next = node.next;
+      if (node.next) node.next.prev = node.prev;
+      if (node === this.tail) this.tail = node.prev;
+      node.prev = null;
+      node.next = this.head;
+      if (this.head) this.head.prev = node;
+      this.head = node;
     }
-    return n.v;
+    return node.value;
   }
-  set(k, v) {
-    let n = this.m.get(k);
-    if (n) {
-      n.v = v;
-      this.get(k);
+  set(key, value) {
+    let node = this.cacheMap.get(key);
+    if (node) {
+      node.value = value;
+      this.get(key);
       return;
     }
-    n = { k, v, prev: null, next: this.h };
-    if (this.h) this.h.prev = n;
-    this.h = n;
-    if (!this.t) this.t = n;
-    this.m.set(k, n);
-    if (this.m.size > this.max) this.evt();
+    node = { key, value, prev: null, next: this.head };
+    if (this.head) this.head.prev = node;
+    this.head = node;
+    if (!this.tail) this.tail = node;
+    this.cacheMap.set(key, node);
+    if (this.cacheMap.size > this.max) this.evict();
   }
-  evt() {
-    if (!this.t) return;
-    let c = this.t;
-    for (let i = 0; i < ev_b && c; i++) {
-      this.m.delete(c.k);
-      c = c.prev;
+  evict() {
+    if (!this.tail) return;
+    let currentNode = this.tail;
+    for (let i = 0; i < evictionBatchSize && currentNode; i++) {
+      this.cacheMap.delete(currentNode.key);
+      currentNode = currentNode.prev;
     }
-    if (c) {
-      c.next = null;
-      this.t = c;
+    if (currentNode) {
+      currentNode.next = null;
+      this.tail = currentNode;
     } else {
-      this.h = null;
-      this.t = null;
+      this.head = null;
+      this.tail = null;
     }
   }
-  clr() {
-    this.m.clear();
-    this.h = null;
-    this.t = null;
+  clear() {
+    this.cacheMap.clear();
+    this.head = null;
+    this.tail = null;
   }
 }
 
-const rc = new lru(csz);
+const resolutionCache = new LRUCache(cacheMaxSize);
 
-class rn {
+class RadixNode {
   constructor() {
-    this.c = null;
-    this.t = null;
-    this.e = "";
-    this.l = false;
+    this.children = null;
+    this.target = null;
+    this.edge = "";
+    this.isLeaf = false;
   }
 }
 
-class rt {
+class RadixTree {
   constructor() {
-    this.r = new rn();
+    this.root = new RadixNode();
   }
 
-  ins(a, t) {
-    let n = this.r;
+  insert(alias, target) {
+    let node = this.root;
     let i = 0;
-    const al = a.length;
+    const aliasLength = alias.length;
 
-    while (i < al) {
-      const cc = a.charCodeAt(i);
-      if (!n.c) n.c = Object.create(null);
-      let ch = n.c[cc];
-      if (!ch) {
-        ch = new rn();
-        ch.e = a.slice(i);
-        ch.t = t;
-        ch.l = true;
-        n.c[cc] = ch;
+    while (i < aliasLength) {
+      const currentChar = alias.charCodeAt(i);
+      if (!node.children) node.children = Object.create(null);
+      let child = node.children[currentChar];
+      if (!child) {
+        child = new RadixNode();
+        child.edge = alias.slice(i);
+        child.target = target;
+        child.isLeaf = true;
+        node.children[currentChar] = child;
         return;
       }
 
-      const ed = ch.e;
+      const edgeString = child.edge;
       let j = 0;
-      const el = ed.length;
-      const rem = al - i;
-      while (j < el && j < rem && ed.charCodeAt(j) === a.charCodeAt(i + j)) j++;
+      const edgeLength = edgeString.length;
+      const remaining = aliasLength - i;
+      while (
+        j < edgeLength &&
+        j < remaining &&
+        edgeString.charCodeAt(j) === alias.charCodeAt(i + j)
+      )
+        j++;
 
-      if (j === el) {
-        i += el;
-        n = ch;
+      if (j === edgeLength) {
+        i += edgeLength;
+        node = child;
         continue;
       }
 
       if (j > 0) {
-        const sp = new rn();
-        sp.e = ed.slice(0, j);
-        sp.c = Object.create(null);
-        ch.e = ed.slice(j);
-        const es = ed.charCodeAt(j);
-        sp.c[es] = ch;
-        const nl = new rn();
-        nl.e = a.slice(i + j);
-        nl.t = t;
-        nl.l = true;
-        const ns = a.charCodeAt(i + j);
-        sp.c[ns] = nl;
-        n.c[cc] = sp;
+        const splitNode = new RadixNode();
+        splitNode.edge = edgeString.slice(0, j);
+        splitNode.children = Object.create(null);
+        child.edge = edgeString.slice(j);
+        const edgeSplitChar = edgeString.charCodeAt(j);
+        splitNode.children[edgeSplitChar] = child;
+        const newLeaf = new RadixNode();
+        newLeaf.edge = alias.slice(i + j);
+        newLeaf.target = target;
+        newLeaf.isLeaf = true;
+        const newSplitChar = alias.charCodeAt(i + j);
+        splitNode.children[newSplitChar] = newLeaf;
+        node.children[currentChar] = splitNode;
         return;
       }
 
-      const br = new rn();
-      br.c = Object.create(null);
-      const es0 = ed.charCodeAt(0);
-      br.c[es0] = ch;
-      const nl2 = new rn();
-      nl2.e = a.slice(i);
-      nl2.t = t;
-      nl2.l = true;
-      const ns2 = a.charCodeAt(i);
-      br.c[ns2] = nl2;
-      n.c[cc] = br;
+      const branchNode = new RadixNode();
+      branchNode.children = Object.create(null);
+      const edgeFirstChar = edgeString.charCodeAt(0);
+      branchNode.children[edgeFirstChar] = child;
+      const newLeaf2 = new RadixNode();
+      newLeaf2.edge = alias.slice(i);
+      newLeaf2.target = target;
+      newLeaf2.isLeaf = true;
+      const newSplitChar2 = alias.charCodeAt(i);
+      branchNode.children[newSplitChar2] = newLeaf2;
+      node.children[currentChar] = branchNode;
       return;
     }
-    n.t = t;
-    n.l = true;
+    node.target = target;
+    node.isLeaf = true;
   }
 
-  fnd(req) {
-    let n = this.r;
-    let lm = null;
-    let d = 0;
-    let ma = "";
-    const rl = req.length;
-    while (d < rl && n) {
-      if (n.l) {
-        const nc = req.charCodeAt(d);
-        if (nc === f_sl || nc === b_sl || nc === sc) {
-          lm = { a: ma, t: n.t };
+  find(request) {
+    let node = this.root;
+    let lastMatch = null;
+    let depth = 0;
+    let matchedAlias = "";
+    const requestLength = request.length;
+    while (depth < requestLength && node) {
+      if (node.isLeaf) {
+        const nextChar = request.charCodeAt(depth);
+        if (
+          nextChar === forwardSlashCode ||
+          nextChar === backSlashCode ||
+          nextChar === separatorCode
+        ) {
+          lastMatch = { alias: matchedAlias, target: node.target };
         }
       }
-      if (!n.c) break;
-      const cd = req.charCodeAt(d);
-      const ch = n.c[cd];
-      if (!ch) break;
-      const ed = ch.e;
-      const el = ed.length;
-      if (req.startsWith(ed, d)) {
-        ma += ed;
-        d += el;
-        if (ch.l && d === rl) return { a: ma, t: ch.t };
-        n = ch;
+      if (!node.children) break;
+      const currentDepthChar = request.charCodeAt(depth);
+      const child = node.children[currentDepthChar];
+      if (!child) break;
+      const edgeData = child.edge;
+      const edgeLen = edgeData.length;
+      if (request.startsWith(edgeData, depth)) {
+        matchedAlias += edgeData;
+        depth += edgeLen;
+        if (child.isLeaf && depth === requestLength)
+          return { alias: matchedAlias, target: child.target };
+        node = child;
         continue;
       }
       let k = 0;
-      while (k < el && d + k < rl && ed.charCodeAt(k) === req.charCodeAt(d + k))
+      while (
+        k < edgeLen &&
+        depth + k < requestLength &&
+        edgeData.charCodeAt(k) === request.charCodeAt(depth + k)
+      )
         k++;
       if (k === 0) break;
       if (
-        ch.l &&
-        (d + k === rl || [f_sl, b_sl, sc].includes(req.charCodeAt(d + k)))
+        child.isLeaf &&
+        (depth + k === requestLength ||
+          [forwardSlashCode, backSlashCode, separatorCode].includes(
+            request.charCodeAt(depth + k),
+          ))
       ) {
-        return { a: ma + ed.slice(0, k), t: ch.t };
+        return {
+          alias: matchedAlias + edgeData.slice(0, k),
+          target: child.target,
+        };
       }
       break;
     }
-    return lm;
+    return lastMatch;
   }
 }
 
-const cp = new Set();
-const am = new Map();
+const customPathsSet = new Set();
+const aliasMap = new Map();
 const seenAliases = new Set();
-let tree = null;
-let sa = null;
-let pa = [];
-let ha = false;
-let ac = false;
-let pc = false;
+let radixTree = null;
+let sortedAliases = null;
+let pathArray = [];
+let hasAliases = false;
+let aliasesChanged = false;
+let pathsChanged = false;
 let lastPkgPath = null;
 
-const Mod = module.constructor.length > 1 ? module.constructor : m;
-const _nmp = Mod._nodeModulePaths;
-const _rfn = Mod._resolveFilename;
+const Module =
+  moduleLib.constructor.length > 1 ? moduleLib.constructor : moduleLib;
+const originalNodeModulePaths = Module._nodeModulePaths;
+const originalResolveFilename = Module._resolveFilename;
 
-
-Mod._nodeModulePaths = function (frm) {
-  if (frm.includes(`${s}node_modules${s}`)) return _nmp.call(this, frm);
-  const ps = _nmp.call(this, frm);
-  return pa.length ? pa.concat(ps) : ps;
+Module._nodeModulePaths = function (fromPath) {
+  if (fromPath.includes(`${pathSeparator}node_modules${pathSeparator}`))
+    return originalNodeModulePaths.call(this, fromPath);
+  const pathsList = originalNodeModulePaths.call(this, fromPath);
+  return pathArray.length ? pathArray.concat(pathsList) : pathsList;
 };
 
+Module._resolveFilename = function (request, parent, isMain, options) {
+  const parentPath = parent?.filename || "";
 
-Mod._resolveFilename = function (req, prnt, isM, opts) {
-  const pp = prnt?.filename || "";
-
-  if (pp.includes(`${s}node_modules${s}`)) {
-    return _rfn.call(this, req, prnt, isM, opts);
+  if (parentPath.includes(`${pathSeparator}node_modules${pathSeparator}`)) {
+    return originalResolveFilename.call(this, request, parent, isMain, options);
   }
 
-  const ck = pp + nul + req;
-  const ch = rc.get(ck);
-  if (ch !== undefined) {
-    if (dbg) console.log(`pathlra-aliaser CACHE HIT ${req} → ${ch}`);
-    return ch;
+  const cacheKey = parentPath + nullSeparator + request;
+  const cachedResult = resolutionCache.get(cacheKey);
+  if (cachedResult !== undefined) {
+    if (debugMode)
+      console.log(`pathlra-aliaser CACHE HIT ${request} → ${cachedResult}`);
+    return cachedResult;
   }
 
-  let rr = req;
-  let mr = null;
+  let resolvedRequest = request;
+  let matchResult = null;
 
-  if (ha) {
-    if (ac) {
-      opt();
-      ac = false;
+  if (hasAliases) {
+    if (aliasesChanged) {
+      optimizeStrategy();
+      aliasesChanged = false;
     }
 
-    if (strat === lin) {
-      const rl = req.length;
-      for (let i = 0; i < sa.length; i++) {
-        const [a, t] = sa[i];
-        const al = a.length;
-        if (al > rl) continue;
-        if (req.startsWith(a)) {
-          if (al === rl || [f_sl, b_sl, sc].includes(req.charCodeAt(al))) {
-            mr = { a, t };
+    if (currentStrategy === STRATEGY_LINEAR) {
+      const requestLength = request.length;
+      for (let i = 0; i < sortedAliases.length; i++) {
+        const [alias, target] = sortedAliases[i];
+        const aliasLength = alias.length;
+        if (aliasLength > requestLength) continue;
+        if (request.startsWith(alias)) {
+          if (
+            aliasLength === requestLength ||
+            [forwardSlashCode, backSlashCode, separatorCode].includes(
+              request.charCodeAt(aliasLength),
+            )
+          ) {
+            matchResult = { alias, target };
             break;
           }
         }
       }
     } else {
-      mr = tree.fnd(req);
+      matchResult = radixTree.find(request);
     }
 
-
-    if (mr) {
-      const { a, t } = mr;
-      const rtg = typeof t === "function" ? t(pp, req, a) : t;
-      if (typeof rtg !== "string") {
+    if (matchResult) {
+      const { alias, target } = matchResult;
+      const resolvedTarget =
+        typeof target === "function"
+          ? target(parentPath, request, alias)
+          : target;
+      if (typeof resolvedTarget !== "string") {
         throw new Error(
           "pathlra-aliaser Custom handler must return string path",
         );
       }
-      if (!isValidTarget(rtg)) {
-        throw new Error(`pathlra-aliaser Invalid alias target detected ${rtg}`);
+      if (!isValidTarget(resolvedTarget)) {
+        throw new Error(
+          `pathlra-aliaser Invalid alias target detected ${resolvedTarget}`,
+        );
       }
-      const sf = req.slice(a.length);
-      rr = sf
-        ? rtg +
-          (sf.charCodeAt(0) === sc || sf.charCodeAt(0) === f_sl ? sf : s + sf)
-        : rtg;
-      if (dbg)
-        console.log(`pathlra-aliaser RESOLVED ${req} → ${rr} (via ${a})`);
-    }
-
-    else if (dbg) {
-      console.log(`pathlra-aliaser NO MATCH ${req}`);
+      const suffix = request.slice(alias.length);
+      resolvedRequest = suffix
+        ? resolvedTarget +
+          (suffix.charCodeAt(0) === backSlashCode ||
+          suffix.charCodeAt(0) === forwardSlashCode
+            ? suffix
+            : pathSeparator + suffix)
+        : resolvedTarget;
+      if (debugMode)
+        console.log(
+          `pathlra-aliaser RESOLVED ${request} → ${resolvedRequest} (via ${alias})`,
+        );
+    } else if (debugMode) {
+      console.log(`pathlra-aliaser NO MATCH ${request}`);
     }
   }
 
-  const res = _rfn.call(this, rr, prnt, isM, opts);
-  rc.set(ck, res);
-  return res;
+  const result = originalResolveFilename.call(
+    this,
+    resolvedRequest,
+    parent,
+    isMain,
+    options,
+  );
+  resolutionCache.set(cacheKey, result);
+  return result;
 };
 
-function isValidTarget(t) {
-  if (t.includes("..")) return false;
-  if (t.includes("~")) return false;
-  if (t.includes("\0")) return false;
+function isValidTarget(targetPath) {
+  if (targetPath.includes("..")) return false;
+  if (targetPath.includes("~")) return false;
+  if (targetPath.includes("\0")) return false;
   try {
-    p.normalize(t);
+    path.normalize(targetPath);
     return true;
   } catch {
     return false;
   }
 }
 
-function aa(a, t) {
-  if (seenAliases.has(a)) {
+function addAlias(alias, target) {
+  if (seenAliases.has(alias)) {
   } else {
-    seenAliases.add(a);
+    seenAliases.add(alias);
   }
-  am.set(a, t);
-  ha = true;
-  ac = true;
+  aliasMap.set(alias, target);
+  hasAliases = true;
+  aliasesChanged = true;
 }
 
-function ap(d) {
-  const nd = p.normalize(d);
-  if (cp.has(nd)) return;
-  cp.add(nd);
-  pa = [...cp].sort((x, y) => y.length - x.length);
-  pc = true;
-  if (hrld) setImmediate(apc);
+function addPath(directory) {
+  const normalizedDir = path.normalize(directory);
+  if (customPathsSet.has(normalizedDir)) return;
+  customPathsSet.add(normalizedDir);
+  pathArray = [...customPathsSet].sort((x, y) => y.length - x.length);
+  pathsChanged = true;
+  if (hotReloadEnabled) setImmediate(applyPathsToCache);
 }
 
-function apc() {
-  if (!pc) return;
-  const mn = require.main;
-  if (mn && !mn._simulateRepl) ump(mn);
-  let pr = module.parent;
-  const sn = new Set();
-  while (pr && !sn.has(pr)) {
-    sn.add(pr);
-    ump(pr);
-    pr = pr.parent;
+function applyPathsToCache() {
+  if (!pathsChanged) return;
+  const mainModule = require.main;
+  if (mainModule && !mainModule._simulateRepl) updateModulePaths(mainModule);
+  let parentModule = module.parent;
+  const seenNodes = new Set();
+  while (parentModule && !seenNodes.has(parentModule)) {
+    seenNodes.add(parentModule);
+    updateModulePaths(parentModule);
+    parentModule = parentModule.parent;
   }
-  pc = false;
+  pathsChanged = false;
 }
 
-function ump(md) {
-  if (!md.paths) return;
-  for (const d of cp) {
-    if (!md.paths.includes(d)) md.paths.unshift(d);
+function updateModulePaths(moduleData) {
+  if (!moduleData.paths) return;
+  for (const dir of customPathsSet) {
+    if (!moduleData.paths.includes(dir)) moduleData.paths.unshift(dir);
   }
 }
 
-function opt() {
-  const cnt = am.size;
-  if (cnt === 0) {
-    ha = false;
-    sa = null;
-    tree = null;
-    strat = lin;
-    minMode = false;
+function optimizeStrategy() {
+  const count = aliasMap.size;
+  if (count === 0) {
+    hasAliases = false;
+    sortedAliases = null;
+    radixTree = null;
+    currentStrategy = STRATEGY_LINEAR;
+    minimalMode = false;
     return;
   }
 
-  minMode = cnt < 10;
-  if (minMode) {
-    rc.max = 1000;
-    ev_b = 100;
+  minimalMode = count < 10;
+  if (minimalMode) {
+    resolutionCache.max = 1000;
+    evictionBatchSize = 100;
   } else {
-    rc.max = csz;
-    ev_b = Math.floor(csz * 0.1);
+    resolutionCache.max = cacheMaxSize;
+    evictionBatchSize = Math.floor(cacheMaxSize * 0.1);
   }
 
-  if (cnt < 100) {
-    strat = lin;
-    sa = [...am.entries()].sort((x, y) => y[0].length - x[0].length);
-    tree = null;
+  if (count < 100) {
+    currentStrategy = STRATEGY_LINEAR;
+    sortedAliases = [...aliasMap.entries()].sort(
+      (x, y) => y[0].length - x[0].length,
+    );
+    radixTree = null;
   } else {
-    strat = rdx;
-    bld();
-    sa = null;
+    currentStrategy = STRATEGY_RADIX;
+    buildRadixTree();
+    sortedAliases = null;
   }
 }
 
-function bld() {
-  tree = new rt();
-  am.forEach((t, a) => tree.ins(a, t));
+function buildRadixTree() {
+  radixTree = new RadixTree();
+  aliasMap.forEach((target, alias) => radixTree.insert(alias, target));
 }
 
-function init(opts = {}) {
-  const st = perf.now();
-  const bs = gbp(opts);
-  const pkg = lpj(bs);
-  lastPkgPath = p.join(bs, "package.json");
+function initialize(options = {}) {
+  const startTime = performanceNow.now();
+  const basePath = getBasePath(options);
+  const packageJson = loadPackageJson(basePath);
+  lastPkgPath = path.join(basePath, "package.json");
 
-  if (opts.debug) dbg = true;
-  if (opts.hotReload) hrld = true;
+  if (options.debug) debugMode = true;
+  if (options.hotReload) hotReloadEnabled = true;
 
-  if (hrld && lastPkgPath) {
-    f.watch(lastPkgPath, () => {
+  if (hotReloadEnabled && lastPkgPath) {
+    fs.watch(lastPkgPath, () => {
       console.log("pathlra-aliaser package.json changed. Reloading aliases...");
-      rst();
-      init({ base: bs, debug: dbg, hotReload: hrld });
+      reset();
+      initialize({
+        base: basePath,
+        debug: debugMode,
+        hotReload: hotReloadEnabled,
+      });
     });
   }
 
-  const cfgKey = Object.keys(pkg).find((k) => k.startsWith("path_aliaser"));
-  const als = cfgKey ? pkg[cfgKey] : {};
+  const configKey = Object.keys(packageJson).find((k) =>
+    k.startsWith("path_aliaser"),
+  );
+  const aliases = configKey ? packageJson[configKey] : {};
 
-  if (Object.keys(als).length === 0) {
-    als["@root"] = ".";
-    als["@src"] = "src";
+  if (Object.keys(aliases).length === 0) {
+    aliases["@root"] = ".";
+    aliases["@src"] = "src";
     console.log(
       "pathlra-aliaser No aliases found. Using defaults: @root → ., @src → src",
     );
   }
 
-  for (const [a, t] of Object.entries(als)) {
-    if (typeof t !== "string" && typeof t !== "function") {
+  for (const [alias, target] of Object.entries(aliases)) {
+    if (typeof target !== "string" && typeof target !== "function") {
       throw new Error(
-        `pathlra-aliaser Invalid alias target for "${a}". Must be string or function`,
+        `pathlra-aliaser Invalid alias target for "${alias}". Must be string or function`,
       );
     }
-    const r = t.startsWith("/") ? t : p.join(bs, t);
-    aa(a, r);
+    const resolvedPath = target.startsWith("/")
+      ? target
+      : path.join(basePath, target);
+    addAlias(alias, resolvedPath);
   }
 
-  const dirs = pkg._moduleDirectories || ["node_modules"];
-  for (const d of dirs) {
-    if (d !== "node_modules") ap(p.join(bs, d));
+  const directories = packageJson._moduleDirectories || ["node_modules"];
+  for (const dir of directories) {
+    if (dir !== "node_modules") addPath(path.join(basePath, dir));
   }
 
-  opt();
-  apc();
+  optimizeStrategy();
+  applyPathsToCache();
 
-  const dur = perf.now() - st;
-  if (dur > 20) {
+  const duration = performanceNow.now() - startTime;
+  if (duration > 20) {
     console.warn(
-      `pathlra-aliaser Init took ${dur.toFixed(1)}ms (optimized for ${
-        am.size
+      `pathlra-aliaser Init took ${duration.toFixed(1)}ms (optimized for ${
+        aliasMap.size
       } aliases)`,
     );
   }
 
   return {
-    aliases: am.size,
-    paths: cp.size,
-    duration: dur,
-    minimalMode: minMode,
+    aliases: aliasMap.size,
+    paths: customPathsSet.size,
+    duration: duration,
+    minimalMode: minimalMode,
   };
 }
 
-function gbp(o) {
-  if (typeof o === "string") o = { base: o };
-  if (o.base) return p.resolve(o.base.replace(/\/package\.json$/, ""));
-  const cands = [p.join(__dirname, "../.."), process.cwd()];
-  for (const c of cands) {
+function getBasePath(options) {
+  if (typeof options === "string") options = { base: options };
+  if (options.base)
+    return path.resolve(options.base.replace(/\/package\.json$/, ""));
+  const candidates = [path.join(__dirname, "../.."), process.cwd()];
+  for (const candidate of candidates) {
     try {
-      f.accessSync(p.join(c, "package.json"), f.constants.R_OK);
-      return c;
+      fs.accessSync(path.join(candidate, "package.json"), fs.constants.R_OK);
+      return candidate;
     } catch {}
   }
-  throw new Error(`Failed to locate package.json in\n${cands.join("\n")}`);
+  throw new Error(`Failed to locate package.json in\n${candidates.join("\n")}`);
 }
 
-function lpj(b) {
+function loadPackageJson(base) {
   try {
-    const pp = p.join(b, "package.json");
-    return JSON.parse(f.readFileSync(pp, "utf8"));
-  } catch (e) {
-    throw new Error(`Failed to load package.json: ${e.message}`);
+    const packagePath = path.join(base, "package.json");
+    return JSON.parse(fs.readFileSync(packagePath, "utf8"));
+  } catch (error) {
+    throw new Error(`Failed to load package.json: ${error.message}`);
   }
 }
 
-function rst() {
-  rc.clr();
-  cp.clear();
-  am.clear();
+function reset() {
+  resolutionCache.clear();
+  customPathsSet.clear();
+  aliasMap.clear();
   seenAliases.clear();
-  pa = [];
-  tree = null;
-  sa = null;
-  ha = false;
-  ac = false;
-  pc = false;
-  dbg = false;
-  hrld = false;
-  minMode = false;
+  pathArray = [];
+  radixTree = null;
+  sortedAliases = null;
+  hasAliases = false;
+  aliasesChanged = false;
+  pathsChanged = false;
+  debugMode = false;
+  hotReloadEnabled = false;
+  minimalMode = false;
 
-  const mn = require.main;
-  if (mn && !mn._simulateRepl) cmp(mn);
-  let pr = module.parent;
-  const sn = new Set();
-  while (pr && !sn.has(pr)) {
-    sn.add(pr);
-    cmp(pr);
-    pr = pr.parent;
+  const mainModule = require.main;
+  if (mainModule && !mainModule._simulateRepl) cleanModulePaths(mainModule);
+  let parentModule = module.parent;
+  const seenNodes = new Set();
+  while (parentModule && !seenNodes.has(parentModule)) {
+    seenNodes.add(parentModule);
+    cleanModulePaths(parentModule);
+    parentModule = parentModule.parent;
   }
-  const ps = [...cp];
-  for (const k of Object.keys(require.cache)) {
-    if (ps.some((x) => k.startsWith(x))) delete require.cache[k];
+  const pathsList = [...customPathsSet];
+  for (const key of Object.keys(require.cache)) {
+    if (pathsList.some((pathItem) => key.startsWith(pathItem)))
+      delete require.cache[key];
   }
 }
 
-function cmp(md) {
-  if (!md.paths) return;
-  md.paths = md.paths.filter((x) => !cp.has(x));
+function cleanModulePaths(moduleData) {
+  if (!moduleData.paths) return;
+  moduleData.paths = moduleData.paths.filter(
+    (pathItem) => !customPathsSet.has(pathItem),
+  );
 }
 
-module.exports = Object.assign(init, {
-  ap,
-  aa,
-  addAliases: (als) => {
-    for (const [a, t] of Object.entries(als)) aa(a, t);
-    ac = true;
+module.exports = Object.assign(initialize, {
+  addPath,
+  addAlias,
+  addAliases: (aliases) => {
+    for (const [alias, target] of Object.entries(aliases))
+      addAlias(alias, target);
+    aliasesChanged = true;
   },
-  rst,
+  reset,
   _internal: {
     getStats: () => ({
-      aliases: am.size,
-      paths: cp.size,
-      cacheSize: rc.m.size,
-      strategy: strat === lin ? "LINEAR" : "RADIX",
-      minimalMode: minMode,
-      hotReload: hrld,
-      debug: dbg,
+      aliases: aliasMap.size,
+      paths: customPathsSet.size,
+      cacheSize: resolutionCache.cacheMap.size,
+      strategy: currentStrategy === STRATEGY_LINEAR ? "LINEAR" : "RADIX",
+      minimalMode: minimalMode,
+      hotReload: hotReloadEnabled,
+      debug: debugMode,
       memory: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2) + " MB",
     }),
-    forceStrategy: (st) => {
-      strat = st;
-      if (st === rdx) bld();
+    forceStrategy: (strategy) => {
+      currentStrategy = strategy;
+      if (strategy === STRATEGY_RADIX) buildRadixTree();
     },
-    clearCache: () => rc.clr(),
+    clearCache: () => resolutionCache.clear(),
     generateTSConfig: () => {
       const compilerOptions = {
         baseUrl: ".",
         paths: {},
       };
-      am.forEach((target, alias) => {
-        let rel = p.relative(process.cwd(), target);
-        if (!rel.startsWith(".")) rel = "./" + rel;
-        compilerOptions.paths[alias + "/*"] = [rel + "/*"];
-        compilerOptions.paths[alias] = [rel];
+      aliasMap.forEach((target, alias) => {
+        let relativePath = path.relative(process.cwd(), target);
+        if (!relativePath.startsWith(".")) relativePath = "./" + relativePath;
+        compilerOptions.paths[alias + "/*"] = [relativePath + "/*"];
+        compilerOptions.paths[alias] = [relativePath];
       });
       return { compilerOptions };
     },
