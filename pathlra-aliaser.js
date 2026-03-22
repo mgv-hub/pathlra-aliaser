@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * pathlra-aliaser v4.6.11
+ * pathlra-aliaser v4.6.9
  *
  * Ultra-fast, high-performance path alias resolver and module loader enhancer
  * Developed by hub-mgv with extreme focus on speed, security, and developer experience
@@ -53,47 +53,40 @@
  * Requested: "@src/utils/helper"
  * Matched alias: "@src" → resolves to "/project/src"
  * Final path: "/project/src/utils/helper"
- *
- * Changelog v4.6.10:
- * - Fixed radix tree alias accumulation bug affecting projects with 100+ aliases
- *
- * Changelog v4.6.11:
- * - Fixed node_modules interference causing incorrect path resolution for nested requires
- * - Added parent path check to skip alias resolution inside node_modules
  */
 
 const path = require("path");
 const moduleLib = require("module");
 const fs = require("fs");
-const { performance: performanceNow } = require("perf_hooks");
+const { performance: performance } = require("perf_hooks");
 
 // Platform-agnostic path separator handling
-const pathSeparator = path.sep;
-const separatorCode = pathSeparator.charCodeAt(0);
-const forwardSlashCode = 47;
-const backSlashCode = 92;
-const nullSeparator = "\0";
-const cacheMaxSize = 10000;
-const evictionBatchSize = Math.floor(cacheMaxSize * 0.1);
-const STRATEGY_LINEAR = 0;
-const STRATEGY_RADIX = 1;
-let currentStrategy = STRATEGY_LINEAR;
+var pathSeparator = path.sep;
+var separatorCode = pathSeparator.charCodeAt(0);
+var forwardSlashCode = 47; // Forward slash code
+var backSlashCode = 92; // Backslash code
+var nullSeparator = "\0"; // Null separator for cache keys
+var cacheMaxSize = 10000; // Max LRU cache size
+var evictionBatchSize = Math.floor(cacheMaxSize * 0.1); // Eviction batch size
+var STRATEGY_LINEAR = 0; // Strategy ID: linear scan
+var STRATEGY_RADIX = 1; // Strategy ID: radix tree
+let currentStrategy = STRATEGY_LINEAR; // Current active strategy
 
 // Developer experience flags
-let debugMode = false;
-let hotReloadEnabled = false;
-let minimalMode = false;
+let debugMode = false; // Debug/verbose mode
+let hotReloadEnabled = false; // Hot-reload enabled
+let minimalMode = false; // Minimal footprint mode (<10 aliases)
 
 /**
  * Lightweight LRU cache with batch eviction
  * Optimized for high-frequency module resolution
  */
 class LRUCache {
-  constructor(maxSize) {
-    this.max = maxSize;
-    this.cacheMap = new Map();
-    this.head = null;
-    this.tail = null;
+  constructor(max) {
+    this.max = max;
+    this.cacheMap = new Map(); // Key -> node
+    this.head = null; // Head (most recently used)
+    this.tail = null; // Tail (least recently used)
   }
   get(key) {
     const node = this.cacheMap.get(key);
@@ -145,8 +138,12 @@ class LRUCache {
   }
 }
 
+// Global resolution cache
 const resolutionCache = new LRUCache(cacheMaxSize);
 
+/**
+ * Radix tree node for path prefix matching
+ */
 class RadixNode {
   constructor() {
     this.children = null;
@@ -156,6 +153,12 @@ class RadixNode {
   }
 }
 
+
+
+
+/**
+ * Radix tree for efficient prefix-based alias lookup
+ */
 class RadixTree {
   constructor() {
     this.root = new RadixNode();
@@ -179,16 +182,11 @@ class RadixTree {
         return;
       }
 
-      const edgeString = child.edge;
+      const edgeData = child.edge;
       let j = 0;
-      const edgeLength = edgeString.length;
+      const edgeLength = edgeData.length;
       const remaining = aliasLength - i;
-      while (
-        j < edgeLength &&
-        j < remaining &&
-        edgeString.charCodeAt(j) === alias.charCodeAt(i + j)
-      )
-        j++;
+      while (j < edgeLength && j < remaining && edgeData.charCodeAt(j) === alias.charCodeAt(i + j)) j++;
 
       if (j === edgeLength) {
         i += edgeLength;
@@ -198,10 +196,10 @@ class RadixTree {
 
       if (j > 0) {
         const splitNode = new RadixNode();
-        splitNode.edge = edgeString.slice(0, j);
+        splitNode.edge = edgeData.slice(0, j);
         splitNode.children = Object.create(null);
-        child.edge = edgeString.slice(j);
-        const edgeSplitChar = edgeString.charCodeAt(j);
+        child.edge = edgeData.slice(j);
+        const edgeSplitChar = edgeData.charCodeAt(j);
         splitNode.children[edgeSplitChar] = child;
         const newLeaf = new RadixNode();
         newLeaf.edge = alias.slice(i + j);
@@ -215,7 +213,7 @@ class RadixTree {
 
       const branchNode = new RadixNode();
       branchNode.children = Object.create(null);
-      const edgeFirstChar = edgeString.charCodeAt(0);
+      const edgeFirstChar = edgeData.charCodeAt(0);
       branchNode.children[edgeFirstChar] = child;
       const newLeaf2 = new RadixNode();
       newLeaf2.edge = alias.slice(i);
@@ -234,17 +232,12 @@ class RadixTree {
     let node = this.root;
     let lastMatch = null;
     let depth = 0;
-    let matchedAlias = "";
     const requestLength = request.length;
     while (depth < requestLength && node) {
       if (node.isLeaf) {
         const nextChar = request.charCodeAt(depth);
-        if (
-          nextChar === forwardSlashCode ||
-          nextChar === backSlashCode ||
-          nextChar === separatorCode
-        ) {
-          lastMatch = { alias: matchedAlias, target: node.target };
+        if (nextChar === forwardSlashCode || nextChar === backSlashCode || nextChar === separatorCode) {
+          lastMatch = { alias: node.edge, target: node.target };
         }
       }
       if (!node.children) break;
@@ -252,34 +245,22 @@ class RadixTree {
       const child = node.children[currentDepthChar];
       if (!child) break;
       const edgeData = child.edge;
-      const edgeLen = edgeData.length;
+      const edgeLength = edgeData.length;
       if (request.startsWith(edgeData, depth)) {
-        matchedAlias += edgeData;
-        depth += edgeLen;
-        if (child.isLeaf && depth === requestLength)
-          return { alias: matchedAlias, target: child.target };
+        depth += edgeLength;
+        if (child.isLeaf && depth === requestLength) return { alias: edgeData, target: child.target };
         node = child;
         continue;
       }
       let k = 0;
-      while (
-        k < edgeLen &&
-        depth + k < requestLength &&
-        edgeData.charCodeAt(k) === request.charCodeAt(depth + k)
-      )
+      while (k < edgeLength && depth + k < requestLength && edgeData.charCodeAt(k) === request.charCodeAt(depth + k))
         k++;
       if (k === 0) break;
       if (
         child.isLeaf &&
-        (depth + k === requestLength ||
-          [forwardSlashCode, backSlashCode, separatorCode].includes(
-            request.charCodeAt(depth + k),
-          ))
+        (depth + k === requestLength || [forwardSlashCode, backSlashCode, separatorCode].includes(request.charCodeAt(depth + k)))
       ) {
-        return {
-          alias: matchedAlias + edgeData.slice(0, k),
-          target: child.target,
-        };
+        return { alias: edgeData.slice(0, k), target: child.target };
       }
       break;
     }
@@ -287,9 +268,15 @@ class RadixTree {
   }
 }
 
-const customPathsSet = new Set();
-const aliasMap = new Map();
-const seenAliases = new Set();
+
+
+
+
+
+// Global state
+const customPathsSet = new Set(); // Custom paths
+const aliasMap = new Map(); // Aliases
+const seenAliases = new Set(); // For duplicate detection
 let radixTree = null;
 let sortedAliases = null;
 let pathArray = [];
@@ -298,35 +285,55 @@ let aliasesChanged = false;
 let pathsChanged = false;
 let lastPkgPath = null;
 
-const Module =
-  moduleLib.constructor.length > 1 ? moduleLib.constructor : moduleLib;
+// Patch Node.js module system
+const Module = moduleLib.constructor.length > 1 ? moduleLib.constructor : moduleLib;
 const originalNodeModulePaths = Module._nodeModulePaths;
 const originalResolveFilename = Module._resolveFilename;
 
 Module._nodeModulePaths = function (fromPath) {
-  if (fromPath.includes(`${pathSeparator}node_modules${pathSeparator}`))
-    return originalNodeModulePaths.call(this, fromPath);
+  if (fromPath.includes(`${pathSeparator}node_modules${pathSeparator}`)) return originalNodeModulePaths.call(this, fromPath);
   const pathsList = originalNodeModulePaths.call(this, fromPath);
   return pathArray.length ? pathArray.concat(pathsList) : pathsList;
 };
 
 Module._resolveFilename = function (request, parent, isMain, options) {
   const parentPath = parent?.filename || "";
-
-  if (parentPath.includes(`${pathSeparator}node_modules${pathSeparator}`)) {
-    return originalResolveFilename.call(this, request, parent, isMain, options);
-  }
-
   const cacheKey = parentPath + nullSeparator + request;
   const cachedResult = resolutionCache.get(cacheKey);
   if (cachedResult !== undefined) {
-    if (debugMode)
-      console.log(`pathlra-aliaser CACHE HIT ${request} → ${cachedResult}`);
+    if (debugMode) console.log(`pathlra-aliaser CACHE HIT ${request} → ${cachedResult}`);
     return cachedResult;
   }
 
   let resolvedRequest = request;
   let matchResult = null;
+
+  /**
+   * ------------------------------------------------------------
+   * Modified Version Notice
+   * ------------------------------------------------------------
+   * This file has been modified from the original "pathlra-aliaser"
+   * library by hub-mgv
+   *
+   * Modifications made by [Mazarita Bot]
+   * Year 2026
+   *
+   * Summary of changes
+   * - Added support for underscore-based alias resolution
+   *
+   * These changes are distributed under the same MIT License.
+   * ------------------------------------------------------------
+   */
+  if (!request.includes("/") && request.includes("_")) {
+    // Added support for underscore-based alias resolution
+    const parts = request.split("_");
+    const aliasCandidate = "_" + parts[1];
+    if (aliasMap.has(aliasCandidate)) {
+      const rest = parts.slice(2).join("_");
+      request = aliasCandidate + (rest ? "/" + rest : "");
+    }
+  }
+  // MIT License
 
   if (hasAliases) {
     if (aliasesChanged) {
@@ -341,12 +348,7 @@ Module._resolveFilename = function (request, parent, isMain, options) {
         const aliasLength = alias.length;
         if (aliasLength > requestLength) continue;
         if (request.startsWith(alias)) {
-          if (
-            aliasLength === requestLength ||
-            [forwardSlashCode, backSlashCode, separatorCode].includes(
-              request.charCodeAt(aliasLength),
-            )
-          ) {
+          if (aliasLength === requestLength || [forwardSlashCode, backSlashCode, separatorCode].includes(request.charCodeAt(aliasLength))) {
             matchResult = { alias, target };
             break;
           }
@@ -358,48 +360,33 @@ Module._resolveFilename = function (request, parent, isMain, options) {
 
     if (matchResult) {
       const { alias, target } = matchResult;
-      const resolvedTarget =
-        typeof target === "function"
-          ? target(parentPath, request, alias)
-          : target;
+      const resolvedTarget = typeof target === "function" ? target(parentPath, request, alias) : target;
       if (typeof resolvedTarget !== "string") {
         throw new Error(
-          "pathlra-aliaser Custom handler must return string path",
+          "pathlra-aliaser Custom handler must return string path"
         );
       }
+      // SECURITY: Validate target path
       if (!isValidTarget(resolvedTarget)) {
-        throw new Error(
-          `pathlra-aliaser Invalid alias target detected ${resolvedTarget}`,
-        );
+        throw new Error(`pathlra-aliaser Invalid alias target detected ${resolvedTarget}`);
       }
       const suffix = request.slice(alias.length);
-      resolvedRequest = suffix
-        ? resolvedTarget +
-          (suffix.charCodeAt(0) === backSlashCode ||
-          suffix.charCodeAt(0) === forwardSlashCode
-            ? suffix
-            : pathSeparator + suffix)
-        : resolvedTarget;
+      resolvedRequest = suffix ? resolvedTarget + (suffix.charCodeAt(0) === separatorCode ? suffix : pathSeparator + suffix) : resolvedTarget;
       if (debugMode)
-        console.log(
-          `pathlra-aliaser RESOLVED ${request} → ${resolvedRequest} (via ${alias})`,
-        );
+        console.log(`pathlra-aliaser RESOLVED ${request} → ${resolvedRequest} (via ${alias})`);
     } else if (debugMode) {
       console.log(`pathlra-aliaser NO MATCH ${request}`);
     }
   }
 
-  const result = originalResolveFilename.call(
-    this,
-    resolvedRequest,
-    parent,
-    isMain,
-    options,
-  );
+  const result = originalResolveFilename.call(this, resolvedRequest, parent, isMain, options);
   resolutionCache.set(cacheKey, result);
   return result;
 };
 
+/**
+ * Validate alias target to prevent path injection
+ */
 function isValidTarget(targetPath) {
   if (targetPath.includes("..")) return false;
   if (targetPath.includes("~")) return false;
@@ -412,8 +399,14 @@ function isValidTarget(targetPath) {
   }
 }
 
+/**
+ * Register single alias with duplicate warning
+ */
 function addAlias(alias, target) {
   if (seenAliases.has(alias)) {
+    console.warn(
+      `pathlra-aliaser WARNING Duplicate alias "${alias}" detected Overwriting`
+    );
   } else {
     seenAliases.add(alias);
   }
@@ -422,6 +415,9 @@ function addAlias(alias, target) {
   aliasesChanged = true;
 }
 
+/**
+ * Add custom module directory
+ */
 function addPath(directory) {
   const normalizedDir = path.normalize(directory);
   if (customPathsSet.has(normalizedDir)) return;
@@ -447,11 +443,14 @@ function applyPathsToCache() {
 
 function updateModulePaths(moduleData) {
   if (!moduleData.paths) return;
-  for (const dir of customPathsSet) {
-    if (!moduleData.paths.includes(dir)) moduleData.paths.unshift(dir);
+  for (const directory of customPathsSet) {
+    if (!moduleData.paths.includes(directory)) moduleData.paths.unshift(directory);
   }
 }
 
+/**
+ * Optimize based on alias count
+ */
 function optimizeStrategy() {
   const count = aliasMap.size;
   if (count === 0) {
@@ -465,6 +464,7 @@ function optimizeStrategy() {
 
   minimalMode = count < 10;
   if (minimalMode) {
+    // Reduce cache size in minimal mode
     resolutionCache.max = 1000;
     evictionBatchSize = 100;
   } else {
@@ -474,9 +474,7 @@ function optimizeStrategy() {
 
   if (count < 100) {
     currentStrategy = STRATEGY_LINEAR;
-    sortedAliases = [...aliasMap.entries()].sort(
-      (x, y) => y[0].length - x[0].length,
-    );
+    sortedAliases = [...aliasMap.entries()].sort((x, y) => y[0].length - x[0].length);
     radixTree = null;
   } else {
     currentStrategy = STRATEGY_RADIX;
@@ -490,66 +488,67 @@ function buildRadixTree() {
   aliasMap.forEach((target, alias) => radixTree.insert(alias, target));
 }
 
+/**
+ * Initialize from package.json or options
+ */
 function initialize(options = {}) {
-  const startTime = performanceNow.now();
+  const startTime = performance.now();
   const basePath = getBasePath(options);
   const packageJson = loadPackageJson(basePath);
   lastPkgPath = path.join(basePath, "package.json");
 
+  // Enable debug mode
   if (options.debug) debugMode = true;
   if (options.hotReload) hotReloadEnabled = true;
 
+  // Auto-watch for changes in dev (hot-reload)
   if (hotReloadEnabled && lastPkgPath) {
     fs.watch(lastPkgPath, () => {
       console.log("pathlra-aliaser package.json changed. Reloading aliases...");
       reset();
-      initialize({
-        base: basePath,
-        debug: debugMode,
-        hotReload: hotReloadEnabled,
-      });
+      initialize({ base: basePath, debug: debugMode, hotReload: hotReloadEnabled });
     });
   }
 
-  const configKey = Object.keys(packageJson).find((k) =>
-    k.startsWith("path_aliaser"),
-  );
+  // Find config section
+  const configKey = Object.keys(packageJson).find((k) => k.startsWith("path_aliaser"));
   const aliases = configKey ? packageJson[configKey] : {};
 
+  // Apply default presets if none exist
   if (Object.keys(aliases).length === 0) {
     aliases["@root"] = ".";
     aliases["@src"] = "src";
     console.log(
-      "pathlra-aliaser No aliases found. Using defaults: @root → ., @src → src",
+      "pathlra-aliaser No aliases found. Using defaults: @root → ., @src → src"
     );
   }
 
+  // Register aliases
   for (const [alias, target] of Object.entries(aliases)) {
     if (typeof target !== "string" && typeof target !== "function") {
       throw new Error(
-        `pathlra-aliaser Invalid alias target for "${alias}". Must be string or function`,
+        `pathlra-aliaser Invalid alias target for "${alias}". Must be string or function`
       );
     }
-    const resolvedPath = target.startsWith("/")
-      ? target
-      : path.join(basePath, target);
+    const resolvedPath = target.startsWith("/") ? target : path.join(basePath, target);
     addAlias(alias, resolvedPath);
   }
 
+  // Custom module directories
   const directories = packageJson._moduleDirectories || ["node_modules"];
-  for (const dir of directories) {
-    if (dir !== "node_modules") addPath(path.join(basePath, dir));
+  for (const directory of directories) {
+    if (directory !== "node_modules") addPath(path.join(basePath, directory));
   }
 
   optimizeStrategy();
   applyPathsToCache();
 
-  const duration = performanceNow.now() - startTime;
+  const duration = performance.now() - startTime;
   if (duration > 20) {
     console.warn(
       `pathlra-aliaser Init took ${duration.toFixed(1)}ms (optimized for ${
         aliasMap.size
-      } aliases)`,
+      } aliases)`
     );
   }
 
@@ -563,8 +562,7 @@ function initialize(options = {}) {
 
 function getBasePath(options) {
   if (typeof options === "string") options = { base: options };
-  if (options.base)
-    return path.resolve(options.base.replace(/\/package\.json$/, ""));
+  if (options.base) return path.resolve(options.base.replace(/\/package\.json$/, ""));
   const candidates = [path.join(__dirname, "../.."), process.cwd()];
   for (const candidate of candidates) {
     try {
@@ -575,9 +573,9 @@ function getBasePath(options) {
   throw new Error(`Failed to locate package.json in\n${candidates.join("\n")}`);
 }
 
-function loadPackageJson(base) {
+function loadPackageJson(basePath) {
   try {
-    const packagePath = path.join(base, "package.json");
+    const packagePath = path.join(basePath, "package.json");
     return JSON.parse(fs.readFileSync(packagePath, "utf8"));
   } catch (error) {
     throw new Error(`Failed to load package.json: ${error.message}`);
@@ -610,24 +608,21 @@ function reset() {
   }
   const pathsList = [...customPathsSet];
   for (const key of Object.keys(require.cache)) {
-    if (pathsList.some((pathItem) => key.startsWith(pathItem)))
-      delete require.cache[key];
+    if (pathsList.some((pathItem) => key.startsWith(pathItem))) delete require.cache[key];
   }
 }
 
 function cleanModulePaths(moduleData) {
   if (!moduleData.paths) return;
-  moduleData.paths = moduleData.paths.filter(
-    (pathItem) => !customPathsSet.has(pathItem),
-  );
+  moduleData.paths = moduleData.paths.filter((pathItem) => !customPathsSet.has(pathItem));
 }
 
+// Public API
 module.exports = Object.assign(initialize, {
   addPath,
   addAlias,
   addAliases: (aliases) => {
-    for (const [alias, target] of Object.entries(aliases))
-      addAlias(alias, target);
+    for (const [alias, target] of Object.entries(aliases)) addAlias(alias, target);
     aliasesChanged = true;
   },
   reset,
@@ -647,6 +642,10 @@ module.exports = Object.assign(initialize, {
       if (strategy === STRATEGY_RADIX) buildRadixTree();
     },
     clearCache: () => resolutionCache.clear(),
+    /**
+     * Generate tsconfig.json paths for TypeScript integration
+     * Usage: fs.writeFileSync('tsconfig.json', JSON.stringify(generateTSConfig(), null, 2))
+     */
     generateTSConfig: () => {
       const compilerOptions = {
         baseUrl: ".",
