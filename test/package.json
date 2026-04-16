@@ -1,0 +1,15 @@
+{
+  "name": "test-express",
+  "version": "1.0.0",
+  "main": "test.js",
+  "dependencies": {
+    "express": "^4.22.1"
+  },
+  "path_aliaser_": {
+    "@productController": "./controllers/productController.js",
+    "@userController": "./controllers/userController.js",
+    "@products": "./routes/products.js",
+    "@users": "./routes/users.js",
+    "@logger": "./utils/logger.js"
+  }
+}

@@ -1,0 +1,15 @@
+{
+    "name": "test-express",
+    "version": "1.0.0",
+    "main": "index.js",
+    "dependencies": {
+        "express": "^4.22.1",
+        "pathlra-aliaser": "^4.6.11"
+    },
+    "path_aliaser_": {
+        "@products": "./routes/products.js",
+        "@users": "./routes/users.js",
+        "@logger": "./utils/logger.js"
+    },
+    "license": "ISC"
+}
