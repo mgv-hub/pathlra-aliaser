@@ -1,7 +1,9 @@
 "use strict";
+
 const express = require("express");
 const e = express();
-require("../index")(); // pathlra-aliaser 4.6.11
+require("../index")();
+
 const productController = require("@productController");
 const userController = require("@userController");
 const productsRoutes = require("@products");
@@ -18,10 +20,12 @@ e.use("/products", productsRoutes);
 e.use("/users", usersRoutes);
 
 logs.log("All modules loaded successfully");
+
 console.log(
   "Users routes",
   usersRoutes.stack.map((r) => r.route?.path),
 );
+
 console.log(
   "Products routes",
   productsRoutes.stack.map((r) => r.route?.path),

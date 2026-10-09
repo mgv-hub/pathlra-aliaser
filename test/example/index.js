@@ -1,6 +1,7 @@
 "use strict";
 
 const pathlra_aliaser = require("pathlra-aliaser");
+
 pathlra_aliaser();
 
 const express = require("express");

@@ -160,12 +160,6 @@ Benchmark results depend on workload and project structure.
 
 ---
 
-
-
-
-
-
-
 ## Feature & Performance Comparison: `pathlra-aliaser` vs Top Alternatives
 
 | Feature / Capability | **`pathlra-aliaser`** ✅ | **`module-alias`** | **`tsconfig-paths`** | **`babel-plugin-module-resolver`** |
@@ -188,16 +182,6 @@ Benchmark results depend on workload and project structure.
 | **Production-Ready Performance** | ✅ **8.7x faster @ 1k aliases**, 60% less RAM | ❌ Degrades with scale | ❌ Not for pure JS projects | ❌ Build-only |
 | **Default Presets** | ✅ `@root`, `@src` auto-applied | ❌ None | ❌ None | ❌ None |
 | **Friendly Error Messages** | ✅ Clear, actionable errors | ⚠️ Generic errors | ⚠️ TS cryptic errors | ⚠️ Babel errors |
-
-
-
-
-
-
-
-
-
-
 
 ---
 ## License
